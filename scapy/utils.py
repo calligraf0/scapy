@@ -1357,6 +1357,226 @@ def rdpcap(filename, count=-1):
 # This allows to not have # type: ignore every time we call those
 # constructors.
 
+class AsyncMixin:
+    def __init__(self, *args, **kwargs):
+        """
+        Standard constructor used for arguments pass
+        Do not override. Use __ainit__ instead
+        """
+        self.__storedargs = args, kwargs
+        self.async_initialized = False
+
+    async def __ainit__(self, *args, **kwargs):
+        """Async constructor, you should implement this"""
+
+    async def __initobj(self):
+        """Crutch used for __await__ after spawning"""
+        assert not self.async_initialized
+        self.async_initialized = True
+        # pass the parameters to __ainit__ that passed to __init__
+        await self.__ainit__(*self.__storedargs[0], **self.__storedargs[1])
+        return self
+
+    def __await__(self):
+        return self.__initobj().__await__()
+
+class AsyncPcapReader():
+
+    nonblocking_socket = True
+    PacketMetadata = collections.namedtuple("PacketMetadata",
+                                            ["sec", "usec", "wirelen", "caplen"])  # noqa: E501
+
+    def __init__(self, filename, fdesc=None, magic=None):
+         # type: (str, _ByteStream, bytes) -> None
+        self.filename = filename
+        self.f = fdesc
+        self.magic = magic        
+
+        # if fdesc is not None, these should be set as we "already read" the header
+        # or find a better way to set these instead of lazily set these on first read
+        self.linktype = None
+        self.snaplen = None
+        self.LLcls = None
+
+        self._to_read = False # file has not been opened yet, lazily delegate this on first packet read
+        if self.f is None:
+            self._to_read = True
+
+    async def _read_packet(self, size=MTU):
+        # type: (int) -> Tuple[bytes, RawPcapReader.PacketMetadata]
+        """return a single packet read from the file as a tuple containing
+        (pkt_data, pkt_metadata)
+
+        raise EOFError when no more packets are available
+        """
+        if self._to_read:
+            #check if gzipped, if so replace self.f to a gzip
+            #...
+            #read pcap header
+            self.filename, self.f, self.magic = await AsyncPcapReader.open(self.filename)
+
+            if self.magic == b"\xa1\xb2\xc3\xd4":  # big endian
+                self.endian = ">"
+                self.nano = False
+            elif self.magic == b"\xd4\xc3\xb2\xa1":  # little endian
+                self.endian = "<"
+                self.nano = False
+            elif self.magic == b"\xa1\xb2\x3c\x4d":  # big endian, nanosecond-precision
+                self.endian = ">"
+                self.nano = True
+            elif self.magic == b"\x4d\x3c\xb2\xa1":  # little endian, nanosecond-precision  # noqa: E501
+                self.endian = "<"
+                self.nano = True
+            else:
+                raise Scapy_Exception(
+                    "Not a pcap capture file (bad magic: %r)" % self.magic
+                )
+                
+            hdr = await self.f.read(20)
+            if len(hdr) < 20:
+                raise Scapy_Exception("Invalid pcap file (too short)")
+            vermaj, vermin, tz, sig, snaplen, linktype = struct.unpack(
+                self.endian + "HHIIII", hdr
+            )
+            self.linktype = linktype
+            self.snaplen = snaplen
+
+            try:
+                self.LLcls = conf.l2types.num2layer[
+                    self.linktype
+                ]  # type: Type[Packet]
+            except KeyError:
+                warning("PcapReader: unknown LL type [%i]/[%#x]. Using Raw packets" % (self.linktype, self.linktype))  # noqa: E501
+                if conf.raw_layer is None:
+                    # conf.raw_layer is set on import
+                    import scapy.packet  # noqa: F401
+                self.LLcls = conf.raw_layer 
+
+            #do not do this again :)
+            self._to_read = False
+
+        hdr = await self.f.read(16)
+        if len(hdr) < 16:
+            raise EOFError
+        sec, usec, caplen, wirelen = struct.unpack(self.endian + "IIII", hdr)
+        return ((await self.f.read(caplen))[:size],
+                AsyncPcapReader.PacketMetadata(sec=sec, usec=usec,
+                                             wirelen=wirelen, caplen=caplen))
+
+    async def read_packet(self, size=MTU, **kwargs):
+        # type: (int, **Any) -> Packet
+        rp = await self._read_packet(size=size)
+        if rp is None:
+            raise EOFError
+        s, pkt_info = rp
+
+        try:
+            p = self.LLcls(s, **kwargs)  # type: Packet
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            if conf.debug_dissector:
+                from scapy.sendrecv import debug
+                debug.crashed_on = (self.LLcls, s)
+                raise
+            if conf.raw_layer is None:
+                # conf.raw_layer is set on import
+                import scapy.packet  # noqa: F401
+            p = conf.raw_layer(s)
+        power = Decimal(10) ** Decimal(-9 if self.nano else -6)
+        p.time = EDecimal(pkt_info.sec + power * pkt_info.usec)
+        p.wirelen = pkt_info.wirelen
+        return p
+
+    async def recv(self, size=MTU, **kwargs):  # type: ignore
+        # type: (int, **Any) -> Packet
+        return await self.read_packet(size=size, **kwargs)
+
+    async def _read_all(self, count=-1):
+        # type: (int) -> List[Packet]
+        """return a list of all packets in the pcap file
+        """
+        res = []  # type: List[Packet]
+        while count != 0:
+            count -= 1
+            try:
+                p = await self.read_packet()  # type: Packet
+            except EOFError:
+                break
+            res.append(p)
+        return res
+
+    async def __anext__(self):
+        # type: () -> Packet
+        try:
+            return await self.read_packet()
+        except EOFError:
+            raise StopAsyncIteration
+
+    def __aiter__(self):
+        return self
+
+    def __aenter__(self):
+        return self
+
+    async def dispatch(self,
+                callback  # type: Callable[[Tuple[bytes, RawPcapReader.PacketMetadata]], Any]  # noqa: E501
+                ):
+        # type: (...) -> None
+        """call the specified callback routine for each packet read
+
+        This is just a convenience function for the main loop
+        that allows for easy launching of packet processing in a
+        thread.
+        """
+        async for p in self:
+            callback(p) #TODO: make this an awaitable async coroutine?
+
+    @staticmethod
+    async def open(fname  # type: Union[IO[bytes], str]
+             ):
+        # type: (...) -> Tuple[str, _ByteStream, bytes]
+        """Open (if necessary) filename, and read the magic."""
+        if isinstance(fname, str):
+            filename = fname
+            fdesc = await aiofiles.open(filename, "rb")  # type: _ByteStream
+            magic = await fdesc.read(2)
+            if magic == b"\x1f\x8b":
+                # GZIP header detected.
+                await fdesc.seek(0)
+                fdesc = gzip.GzipFile(fileobj=fdesc)
+                magic = await fdesc.read(2)
+            magic += await fdesc.read(2)
+        else:
+            fdesc = fname
+            filename = getattr(fdesc, "name", "No name")
+            magic = await fdesc.read(4)
+
+        return filename, fdesc, magic
+
+    def fileno(self):
+        # type: () -> int
+        return -1 if WINDOWS else self.f.fileno()
+
+    async def close(self):
+        # type: () -> None
+        if isinstance(self.f, gzip.GzipFile):
+            self.f.fileobj.close()  # type: ignore
+        await self.f.close()
+
+    async def __aexit__(self, exc_type, exc_value, tracback):
+        # type: (Optional[Any], Optional[Any], Optional[Any]) -> None
+        await self.close()
+
+    # emulate SuperSocket
+    @staticmethod
+    def select(sockets,  # type: List[SuperSocket]
+               remain=None,  # type: Optional[float]
+               ):
+        # type: (...) -> List[SuperSocket]
+        return sockets
+
+
 class PcapReader_metaclass(type):
     """Metaclass for (Raw)Pcap(Ng)Readers"""
 
@@ -1568,263 +1788,6 @@ class RawPcapReader(metaclass=PcapReader_metaclass):
                ):
         # type: (...) -> List[SuperSocket]
         return sockets
-
-
-class AsyncPcapReader_metaclass(type):
-    """Metaclass for (Raw)Pcap(Ng)Readers"""
-
-    def __new__(cls, name, bases, dct):
-        # type: (Any, str, Any, Dict[str, Any]) -> Any
-        """The `alternative` class attribute is declared in the PcapNg
-        variant, and set here to the Pcap variant.
-
-        """
-        newcls = super(AsyncPcapReader_metaclass, cls).__new__(
-            cls, name, bases, dct
-        )
-        if 'alternative' in dct:
-            dct['alternative'].alternative = newcls
-        return newcls
-
-    async def __call__(cls, filename):
-        # type: (Union[IO[bytes], str]) -> Any
-        """Creates a cls instance, use the `alternative` if that
-        fails.
-
-        """
-        i = cls.__new__(
-            cls,
-            cls.__name__,
-            cls.__bases__,
-            cls.__dict__  # type: ignore
-        )
-        filename, fdesc, magic = await cls.open(filename)
-        if not magic:
-            raise Scapy_Exception(
-                "No data could be read!"
-            )
-        try:
-            i.__init__(filename, fdesc, magic)
-            return i
-        except (Scapy_Exception, EOFError):
-            pass
-
-        if "alternative" in cls.__dict__:
-            cls = cls.__dict__["alternative"]
-            i = cls.__new__(
-                cls,
-                cls.__name__,
-                cls.__bases__,
-                cls.__dict__  # type: ignore
-            )
-            try:
-                i.__init__(filename, fdesc, magic)
-                return i
-            except (Scapy_Exception, EOFError):
-                pass
-
-        raise Scapy_Exception("Not a supported capture file")
-
-    @staticmethod
-    async def open(fname  # type: Union[IO[bytes], str]
-             ):
-        # type: (...) -> Tuple[str, _ByteStream, bytes]
-        """Open (if necessary) filename, and read the magic."""
-        if isinstance(fname, str):
-            filename = fname
-            fdesc = await aiofiles.open(filename, "rb")  # type: _ByteStream
-            magic = await fdesc.read(2)
-            if magic == b"\x1f\x8b":
-                # GZIP header detected.
-                await fdesc.seek(0)
-                fdesc = gzip.GzipFile(fileobj=fdesc) #TODO: find async gzip alternative or wrap
-                magic = fdesc.read(2)
-            magic += fdesc.read(2)
-        else:
-            fdesc = fname
-            filename = getattr(fdesc, "name", "No name")
-            magic = fdesc.read(4)
-        return filename, fdesc, magic
-
-
-class AsyncRawPcapReader(metaclass=AsyncPcapReader_metaclass):
-    """A stateful pcap reader. Each packet is returned as a string"""
-
-    # TODO: use Generics to properly type the various readers.
-    # As of right now, RawPcapReader is typed as if it returned packets
-    # because all of its child do. Fix that
-
-    nonblocking_socket = True
-    PacketMetadata = collections.namedtuple("PacketMetadata",
-                                            ["sec", "usec", "wirelen", "caplen"])  # noqa: E501
-
-    def __init__(self, filename, fdesc=None, magic=None):  # type: ignore
-        # type: (str, _ByteStream, bytes) -> None
-        self.filename = filename
-        self.f = fdesc
-        if magic == b"\xa1\xb2\xc3\xd4":  # big endian
-            self.endian = ">"
-            self.nano = False
-        elif magic == b"\xd4\xc3\xb2\xa1":  # little endian
-            self.endian = "<"
-            self.nano = False
-        elif magic == b"\xa1\xb2\x3c\x4d":  # big endian, nanosecond-precision
-            self.endian = ">"
-            self.nano = True
-        elif magic == b"\x4d\x3c\xb2\xa1":  # little endian, nanosecond-precision  # noqa: E501
-            self.endian = "<"
-            self.nano = True
-        else:
-            raise Scapy_Exception(
-                "Not a pcap capture file (bad magic: %r)" % magic
-            )
-        hdr = self.f.read(20)
-        if len(hdr) < 20:
-            raise Scapy_Exception("Invalid pcap file (too short)")
-        vermaj, vermin, tz, sig, snaplen, linktype = struct.unpack(
-            self.endian + "HHIIII", hdr
-        )
-        self.linktype = linktype
-        self.snaplen = snaplen
-
-    def __enter__(self):
-        # type: () -> AsyncRawPcapReader
-        return self
-
-    async def __aiter__(self):
-        # type: () -> AsyncRawPcapReader
-        return self
-
-    async def __anext__(self):
-        # type: () -> Tuple[bytes, AsyncRawPcapReader.PacketMetadata]
-        """
-        implement the iterator protocol on a set of packets in a pcap file
-        """
-        try:
-            return await self._read_packet()
-        except EOFError:
-            raise StopAsyncIteration
-
-    async def _read_packet(self, size=MTU):
-        # type: (int) -> Tuple[bytes, AsyncRawPcapReader.PacketMetadata]
-        """return a single packet read from the file as a tuple containing
-        (pkt_data, pkt_metadata)
-
-        raise EOFError when no more packets are available
-        """
-        hdr = await self.f.read(16)
-        if len(hdr) < 16:
-            raise EOFError
-        sec, usec, caplen, wirelen = struct.unpack(self.endian + "IIII", hdr)
-        return (self.f.read(caplen)[:size],
-                AsyncRawPcapReader.PacketMetadata(sec=sec, usec=usec,
-                                             wirelen=wirelen, caplen=caplen))
-
-    def read_packet(self, size=MTU):
-    # type: (int) -> Packet     
-        raise Exception(
-            "Cannot call read_packet() in RawPcapReader. Use "
-            "_read_packet()"
-        )
-
-    def dispatch(self,
-                 callback  # type: Callable[[Tuple[bytes, RawPcapReader.PacketMetadata]], Any]  # noqa: E501
-                 ):
-        # type: (...) -> None
-        """call the specified callback routine for each packet read
-
-        This is just a convenience function for the main loop
-        that allows for easy launching of packet processing in a
-        thread.
-        """
-        for p in self:
-            callback(p)
-
-    def _read_all(self, count=-1):
-        # type: (int) -> List[Packet]
-        """return a list of all packets in the pcap file
-        """
-        res = []  # type: List[Packet]
-        while count != 0:
-            count -= 1
-            try:
-                p = self.read_packet()  # type: Packet #TODO: check, shouldnt this be self._read_packet() instead?
-            except EOFError:
-                break
-            res.append(p)
-        return res
-
-    async def recv(self, size=MTU):
-        # type: (int) -> bytes
-        """ Emulate a socket
-        """
-        return await self._read_packet(size=size)[0]
-
-    def fileno(self):
-        # type: () -> int
-        return -1 if WINDOWS else self.f.fileno()
-
-    def close(self):
-        # type: () -> None
-        if isinstance(self.f, gzip.GzipFile):   #TODO: change to async gzip alternative
-            self.f.fileobj.close()  # type: ignore
-        self.f.close()
-
-    def __exit__(self, exc_type, exc_value, tracback):
-        # type: (Optional[Any], Optional[Any], Optional[Any]) -> None
-        self.close()
-
-    # emulate SuperSocket
-    @staticmethod
-    def select(sockets,  # type: List[SuperSocket]
-               remain=None,  # type: Optional[float]
-               ):
-        # type: (...) -> List[SuperSocket]
-        return sockets
-
-class AsyncPcapReader(AsyncRawPcapReader):
-    def __init__(self, filename, fdesc=None, magic=None):  # type: ignore
-        # type: (str, IO[bytes], bytes) -> None
-        AsyncRawPcapReader.__init__(self, filename, fdesc, magic)
-        try:
-            self.LLcls = conf.l2types.num2layer[
-                self.linktype
-            ]  # type: Type[Packet]
-        except KeyError:
-            warning("AsyncPcapReader: unknown LL type [%i]/[%#x]. Using Raw packets" % (self.linktype, self.linktype))  # noqa: E501
-            if conf.raw_layer is None:
-                # conf.raw_layer is set on import
-                import scapy.packet  # noqa: F401
-            self.LLcls = conf.raw_layer
-
-    def __enter__(self):
-        # type: () -> AsyncPcapReader
-        return self
-
-    async def read_packet(self, size=MTU, **kwargs):
-        # type: (int, **Any) -> Packet
-        rp = await super(AsyncPcapReader, self)._read_packet(size=size)
-        if rp is None:
-            raise EOFError
-        s, pkt_info = rp
-
-        try:
-            p = self.LLcls(s, **kwargs)  # type: Packet
-        except KeyboardInterrupt:
-            raise
-        except Exception:
-            if conf.debug_dissector:
-                from scapy.sendrecv import debug
-                debug.crashed_on = (self.LLcls, s)
-                raise
-            if conf.raw_layer is None:
-                # conf.raw_layer is set on import
-                import scapy.packet  # noqa: F401
-            p = conf.raw_layer(s)
-        power = Decimal(10) ** Decimal(-9 if self.nano else -6)
-        p.time = EDecimal(pkt_info.sec + power * pkt_info.usec)
-        p.wirelen = pkt_info.wirelen
-        return p
 
 class PcapReader(RawPcapReader):
     def __init__(self, filename, fdesc=None, magic=None):  # type: ignore
