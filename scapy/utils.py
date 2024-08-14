@@ -1469,7 +1469,7 @@ class AsyncPcapReader():
         if rp is None:
             raise EOFError
         s, pkt_info = rp
-
+    
         try:
             p = self.LLcls(s, **kwargs)  # type: Packet
         except KeyboardInterrupt:
@@ -1492,6 +1492,12 @@ class AsyncPcapReader():
         # type: (int, **Any) -> Packet
         return await self.read_packet(size=size, **kwargs)
 
+    async def read_all(self, count=-1):
+        # type: (int) -> PacketList
+        res = await self._read_all(count)
+        from scapy import plist
+        return plist.PacketList(res, name=os.path.basename(self.filename))
+
     async def _read_all(self, count=-1):
         # type: (int) -> List[Packet]
         """return a list of all packets in the pcap file
@@ -1501,6 +1507,7 @@ class AsyncPcapReader():
             count -= 1
             try:
                 p = await self.read_packet()  # type: Packet
+                print(p)
             except EOFError:
                 break
             res.append(p)
